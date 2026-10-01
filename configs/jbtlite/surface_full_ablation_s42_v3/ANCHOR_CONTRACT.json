@@ -1,0 +1,37 @@
+{
+  "source_anchor": "/mnt/data/work_ablation/code/configs/jbtlite/surface_ablation_redesign_v2/FULL_STEP_E30.yaml",
+  "source_anchor_sha256": "18c3e262dbbc53ec15d4e5e5d069bf046c1761ba203538ea77250e5c4d882215",
+  "final_anchor": {
+    "dataset": "BUSI",
+    "seed": 42,
+    "epochs": 100,
+    "batch_size": 24,
+    "lr": 0.0003,
+    "val_mc": 10,
+    "test_mc": 30,
+    "radius": 1,
+    "lambda0": 0.05,
+    "schedule": "hard_cutoff",
+    "cutoff_epoch": 30,
+    "grad_scope": "all",
+    "aux_loss": "surface"
+  },
+  "known_reference_test_only_not_preloaded_into_new_results": {
+    "BASE": [
+      85.0,
+      54.62,
+      87.63
+    ],
+    "SURFACE_ALWAYS": [
+      86.39,
+      59.88,
+      89.07
+    ],
+    "FULL_STEP_E30": [
+      87.15,
+      59.85,
+      89.84
+    ]
+  },
+  "policy": "All 16 arms are rerun at seed 42 in one study. Radius/weight sensitivity stay validation-only; all component/schedule/objective arms use locked Test MC30 after validation freeze."
+}
