@@ -1,0 +1,187 @@
+# -*- coding: utf-8 -*-
+"""BUSI dataloader with text-consistent ultrasound augmentation.
+
+The public API is intentionally identical to the original MedCLIPSeg loader.
+V479 removes unsynchronised flips/crops and keeps only mild transforms that
+preserve the spatial semantics of text prompts.
+"""
+from __future__ import annotations
+
+import os
+import random
+from pathlib import Path
+from typing import Any, Dict, Iterable
+
+import cv2
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+CLIP_MEAN = np.asarray([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+CLIP_STD = np.asarray([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+
+
+def _cfg_get(node: Any, key: str, default: Any = None) -> Any:
+    if node is None:
+        return default
+    if isinstance(node, dict):
+        return node.get(key, default)
+    return getattr(node, key, default)
+
+
+def _resolve(root: str | Path, folder: str, filename: str) -> str:
+    filename = str(filename)
+    if os.path.isabs(filename) and os.path.isfile(filename):
+        return filename
+    candidate = os.path.join(str(root), folder, filename)
+    if os.path.isfile(candidate):
+        return candidate
+    candidate = os.path.join(str(root), filename)
+    if os.path.isfile(candidate):
+        return candidate
+    return os.path.join(str(root), folder, filename)
+
+
+def _to_tensor(image: np.ndarray, mask: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+    image = image.astype(np.float32) / 255.0
+    image = (image - CLIP_MEAN[None, None]) / CLIP_STD[None, None]
+    image = torch.from_numpy(image.transpose(2, 0, 1).copy()).float()
+    mask = torch.from_numpy((mask > 127).astype(np.float32).copy())
+    return image, mask
+
+
+class RandomGenerator:
+    """Mild, prompt-safe BUSI augmentation.
+
+    No horizontal/vertical flips and no random crops are used, because the
+    prompts may contain left/right or upper/lower location terms.  Image and
+    mask always share the same geometric transform.
+    """
+
+    def __init__(self, output_size, cfg=None):
+        self.output_size = tuple(int(x) for x in output_size)
+        train_cfg = _cfg_get(cfg, "TRAIN", None)
+        self.semantic_safe = bool(_cfg_get(train_cfg, "USE_SEMANTIC_SAFE_AUG", True))
+        self.rotation = float(_cfg_get(train_cfg, "AUG_ROTATION_DEGREES", 15.0))
+        self.scale_low = float(_cfg_get(train_cfg, "AUG_SCALE_MIN", 0.95))
+        self.scale_high = float(_cfg_get(train_cfg, "AUG_SCALE_MAX", 1.05))
+        self.translate = float(_cfg_get(train_cfg, "AUG_TRANSLATE_FRACTION", 0.03))
+        self.gamma_low = float(_cfg_get(train_cfg, "AUG_GAMMA_MIN", 0.90))
+        self.gamma_high = float(_cfg_get(train_cfg, "AUG_GAMMA_MAX", 1.10))
+        self.speckle_std = float(_cfg_get(train_cfg, "AUG_SPECKLE_STD", 0.02))
+
+    def __call__(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        image = np.asarray(sample["image"]).copy()
+        mask = np.asarray(sample["ground_truth_mask"]).copy()
+        if image.ndim == 2:
+            image = np.repeat(image[..., None], 3, axis=2)
+        if image.shape[2] == 4:
+            image = image[..., :3]
+
+        if self.semantic_safe:
+            height, width = mask.shape[:2]
+            if random.random() < 0.50:
+                angle = random.uniform(-self.rotation, self.rotation)
+                scale = random.uniform(self.scale_low, self.scale_high)
+                tx = random.uniform(-self.translate, self.translate) * width
+                ty = random.uniform(-self.translate, self.translate) * height
+                matrix = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), angle, scale)
+                matrix[0, 2] += tx
+                matrix[1, 2] += ty
+                image = cv2.warpAffine(
+                    image, matrix, (width, height), flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT_101,
+                )
+                mask = cv2.warpAffine(
+                    mask, matrix, (width, height), flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+                )
+            if random.random() < 0.30:
+                gamma = random.uniform(self.gamma_low, self.gamma_high)
+                normalized = np.clip(image.astype(np.float32) / 255.0, 0.0, 1.0)
+                image = np.clip(np.power(normalized, gamma) * 255.0, 0, 255).astype(np.uint8)
+            if random.random() < 0.20:
+                contrast = random.uniform(0.90, 1.10)
+                brightness = random.uniform(-0.08, 0.08) * 255.0
+                image = np.clip(image.astype(np.float32) * contrast + brightness, 0, 255).astype(np.uint8)
+            if random.random() < 0.20 and self.speckle_std > 0:
+                noise = np.random.normal(0.0, self.speckle_std, image.shape[:2]).astype(np.float32)
+                noisy = image.astype(np.float32) * (1.0 + noise[..., None])
+                image = np.clip(noisy, 0, 255).astype(np.uint8)
+            if random.random() < 0.10:
+                image = cv2.GaussianBlur(image, (3, 3), 0)
+
+        target_h, target_w = self.output_size
+        image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        image_tensor, mask_tensor = _to_tensor(image, mask)
+        output = dict(sample)
+        output["image"] = image_tensor
+        output["ground_truth_mask"] = mask_tensor
+        return output
+
+
+class ValGenerator:
+    def __init__(self, output_size):
+        self.output_size = tuple(int(x) for x in output_size)
+
+    def __call__(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        image = np.asarray(sample["image"])
+        mask = np.asarray(sample["ground_truth_mask"])
+        if image.ndim == 2:
+            image = np.repeat(image[..., None], 3, axis=2)
+        if image.shape[2] == 4:
+            image = image[..., :3]
+        target_h, target_w = self.output_size
+        image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        image_tensor, mask_tensor = _to_tensor(image, mask)
+        output = dict(sample)
+        output["image"] = image_tensor
+        output["ground_truth_mask"] = mask_tensor
+        return output
+
+
+class DatasetSegmentation(Dataset):
+    def __init__(self, root_path, dataset_name, text_prompts, transform=None, image_size=224):
+        self.root_path = str(root_path)
+        self.dataset_name = str(dataset_name)
+        self.transform = transform
+        self.image_size = int(image_size)
+        self.rows = list(text_prompts)
+        self.data_pairs = []
+        for row in self.rows:
+            image_name = row.get("Image", row.get("image", row.get("image_name")))
+            mask_name = row.get("Ground Truth", row.get("ground_truth", row.get("mask_name")))
+            description = row.get("Description", row.get("description", row.get("text_prompt", "")))
+            if image_name is None or mask_name is None:
+                raise KeyError(
+                    "Prompt spreadsheet must contain Image and Ground Truth columns; "
+                    f"got keys={sorted(row)}"
+                )
+            image_path = _resolve(self.root_path, "image", str(image_name))
+            mask_path = _resolve(self.root_path, "label", str(mask_name))
+            self.data_pairs.append((image_path, mask_path, str(description)))
+
+    def __len__(self):
+        return len(self.data_pairs)
+
+    def __getitem__(self, index):
+        image_path, mask_path, description = self.data_pairs[index]
+        image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise FileNotFoundError(image_path)
+        if mask is None:
+            raise FileNotFoundError(mask_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        sample = {
+            "image": image,
+            "ground_truth_mask": mask,
+            "image_name": os.path.basename(image_path),
+            "mask_name": os.path.basename(mask_path),
+            "text_prompt": description,
+        }
+        if self.transform is not None:
+            sample = self.transform(sample)
+        return sample
