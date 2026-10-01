@@ -1,0 +1,2 @@
+# Set this when running locally; do not commit datasets.
+DATA_ROOT=/path/to/MedCLIPSeg-main/data
